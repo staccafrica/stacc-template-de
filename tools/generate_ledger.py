@@ -1,7 +1,9 @@
 """Generate a deterministic, synthetic payment-settlement dataset for the Stacc Data Engineering project.
 
 Why synthetic: real settlement ledgers are confidential. This one is generated, so you can publish
-the whole repository, and the same --seed always produces byte-identical files.
+the whole repository. The data is seeded from your GitHub username, so you get the same files every run
+and other learners get different ones (their totals, late days and failures differ from yours).
+Pass --seed 42 for the shared reference data.
 
     python tools/generate_ledger.py --rows 1000000 --out data            # quick local run
     python tools/generate_ledger.py --rows 10000000 --out data           # the Spark-scale run
@@ -15,15 +17,30 @@ Standard library only.
 """
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
+import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 CATEGORIES = ["grocery", "fuel", "restaurants", "electronics", "travel", "utilities", "pharmacy", "fashion"]
 COUNTRIES = ["NG", "GH", "KE", "ZA", "EG"]
 STATUSES = [("settled", 0.93), ("reversed", 0.04), ("pending", 0.03)]
 START = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+def learner_seed():
+    """A stable seed per learner: the owner of the repository's GitHub remote. Falls back to 42."""
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5).stdout
+        owner = re.search(r"github\.com[:/]([^/]+)/", url)
+        if owner:
+            return int.from_bytes(hashlib.sha256(owner.group(1).lower().encode()).digest()[:4], "big")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 42
 
 
 def pick_status(rng):
@@ -42,10 +59,12 @@ def main():
     parser.add_argument("--merchants", type=int, default=2_000)
     parser.add_argument("--accounts", type=int, default=200_000)
     parser.add_argument("--events", type=int, default=100_000, help="rows in events.jsonl (0 to skip)")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="default: derived from your GitHub username")
     parser.add_argument("--out", default="data")
     args = parser.parse_args()
 
+    if args.seed is None:
+        args.seed = learner_seed()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 

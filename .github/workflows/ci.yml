@@ -20,5 +20,6 @@ jobs:
           if compgen -G "tests/test_*.py" > /dev/null; then
             pytest -q
           else
-            echo "No tests yet. Your first milestone adds them."
+            echo "Add your milestone acceptance tests before submitting."
+            exit 1
           fi
