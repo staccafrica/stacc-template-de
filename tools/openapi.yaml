@@ -1,0 +1,226 @@
+openapi: 3.0.3
+info:
+  title: Settlements API
+  version: "2024-06-01"
+  description: |
+    The payments partner's API, served locally by tools/settlement_api.py from the files that
+    tools/generate_ledger.py writes. Amounts are integers in minor units (kobo, cents, piastres).
+    Times are UTC, ISO 8601. Lists are ordered oldest first by created_at (payouts by settlement_date).
+
+    Treat it like a real partner: it rate-limits per key, fails now and then, and delivers at least once,
+    so a page can repeat the last record of the page before. Make your client idempotent.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/transactions:
+    get:
+      summary: List payments
+      description: |
+        Without filters this returns every payment the partner has released so far. For incremental loads,
+        save the last next_cursor you finished, or ask for updated_since your last successful run: payments
+        change after they are created (pending to settled, settled to reversed or charged_back).
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: created_from
+          in: query
+          description: Payments created at or after this date or time (2024-03-01 or 2024-03-01T10:00:00Z).
+          schema: { type: string }
+        - name: created_to
+          in: query
+          description: Payments created before this date or time. Use with created_from for a daily batch or a backfill.
+          schema: { type: string }
+        - name: updated_since
+          in: query
+          description: Payments whose updated_at is at or after this time, including old payments that changed.
+          schema: { type: string }
+        - name: merchant_id
+          in: query
+          schema: { type: string, example: M00042 }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/Status" }
+      responses:
+        "200":
+          description: A page of payments.
+          headers:
+            X-RateLimit-Limit: { $ref: "#/components/headers/X-RateLimit-Limit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/X-RateLimit-Remaining" }
+            X-RateLimit-Reset: { $ref: "#/components/headers/X-RateLimit-Reset" }
+            X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Transaction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "503": { $ref: "#/components/responses/ServerError" }
+  /v1/payouts:
+    get:
+      summary: List payouts (one settlement batch per merchant per day)
+      description: Reconcile these against your payments. gross_minor is the sum of a batch's settled payments.
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: settlement_date_from
+          in: query
+          schema: { type: string, format: date }
+        - name: settlement_date_to
+          in: query
+          description: Inclusive.
+          schema: { type: string, format: date }
+        - name: merchant_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of payouts.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Payout" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "503": { $ref: "#/components/responses/ServerError" }
+  /health:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: The API is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The value of STACC_API_KEY that the server was started with. Keep it in .env, never in Git.
+  parameters:
+    limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+    cursor:
+      name: cursor
+      in: query
+      description: The next_cursor from the previous page. Opaque. Send the same filters with it, or you get cursor_mismatch.
+      schema: { type: string }
+  headers:
+    X-RateLimit-Limit:
+      description: Requests per second allowed for your key.
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Requests left in the current burst.
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Unix time when the burst is full again.
+      schema: { type: integer }
+    X-Request-Id:
+      description: Quote this when you report a problem. Every response has one.
+      schema: { type: string, example: req_8f3a2c1d9e0b4a76 }
+  responses:
+    BadRequest:
+      description: A bad parameter or cursor. Fix the request; retrying it unchanged fails again.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: The Authorization header is missing or the key is wrong.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests. Wait Retry-After seconds, then retry.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ServerError:
+      description: A temporary failure on the partner's side. Retry with exponential backoff and jitter.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Status:
+      type: string
+      enum: [pending, failed, settled, reversed, charged_back]
+    ListEnvelope:
+      type: object
+      required: [object, data, has_more, next_cursor]
+      properties:
+        object: { type: string, enum: [list] }
+        has_more: { type: boolean }
+        next_cursor:
+          type: string
+          nullable: true
+          description: Null when there is nothing more released yet. Late data can still arrive later.
+    Transaction:
+      type: object
+      properties:
+        object: { type: string, enum: [transaction] }
+        txn_id: { type: string, example: T0000000042, description: Unique per payment. The partner occasionally sends a payment twice. }
+        reference: { type: string, example: ORD-4821930, description: The merchant's own order reference. Not unique. }
+        merchant_id: { type: string, example: M00042 }
+        account_id: { type: string, nullable: true, example: A0012345 }
+        amount_minor: { type: integer, example: 1250000 }
+        fee_minor: { type: integer, description: The processor's fee. 0 until settled. }
+        net_minor: { type: integer, description: amount_minor minus fee_minor. }
+        currency: { type: string, example: NGN, description: "ISO 4217: NGN, KES, GHS, ZAR or EGP." }
+        payment_method: { type: string, enum: [card, bank_transfer, ussd, mobile_money] }
+        card_brand: { type: string, nullable: true, enum: [verve, visa, mastercard, null] }
+        status: { $ref: "#/components/schemas/Status" }
+        created_at: { type: string, format: date-time }
+        settled_at: { type: string, format: date-time, nullable: true, description: The next business day after a successful payment. }
+        reversed_at: { type: string, format: date-time, nullable: true, description: When a refund or chargeback happened. }
+        updated_at: { type: string, format: date-time, description: The latest of created_at, settled_at and reversed_at. }
+        settlement_id: { type: string, nullable: true, example: STL-20240305-M00042, description: The payout batch this payment was paid in. }
+        terminal_id: { type: string, nullable: true, description: Card payments only. Added on 2024-07-01; older card payments do not have the field at all. }
+    Payout:
+      type: object
+      properties:
+        object: { type: string, enum: [payout] }
+        settlement_id: { type: string }
+        merchant_id: { type: string }
+        currency: { type: string }
+        settlement_date: { type: string, format: date }
+        gross_minor: { type: integer }
+        fees_minor: { type: integer }
+        net_minor: { type: integer }
+        txn_count: { type: integer }
+        paid_at: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type: { type: string, enum: [invalid_request_error, authentication_error, rate_limit_error, api_error] }
+            code: { type: string, example: rate_limited }
+            message: { type: string }
+            request_id: { type: string }
